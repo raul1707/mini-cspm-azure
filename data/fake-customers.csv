@@ -1,0 +1,5 @@
+# FAKE DATA for a security lab. Every name, email and number below is invented.
+customer_id,name,email,card_last4,city
+1001,Test User One,user1@example.com,0000,Sampletown
+1002,Test User Two,user2@example.com,1111,Sampletown
+1003,Test User Three,user3@example.com,2222,Sampletown

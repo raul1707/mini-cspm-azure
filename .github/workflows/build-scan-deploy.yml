@@ -1,0 +1,113 @@
+# mini CSPM Azure lab: build -> Trivy scan (report only) -> push to GHCR -> deploy ARM to Azure
+#
+# Pull requests: build + scan only (nothing is deployed).
+# Push to main or manual run: build + scan + deploy.
+# The scans never block: this lab deploys a vulnerable image and template ON PURPOSE.
+name: build-scan-deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write          # push the image to GitHub Container Registry
+  security-events: write   # upload Trivy results to the Security tab
+  id-token: write          # OIDC: GitHub proves who it is to Azure, no stored password
+
+jobs:
+  build-scan-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set image name (GHCR needs lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vulnapp:${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: docker build -t "$IMAGE" app
+
+      # ---------- Trivy: container image (CVEs) ----------
+      - name: Trivy image scan - table in the log
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+
+      - name: Trivy image scan - SARIF for the Security tab
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: '0'
+          skip-setup-trivy: true
+
+      # ---------- Trivy: ARM template + Dockerfile (misconfigurations) ----------
+      - name: Trivy config scan - ARM template and Dockerfile
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-config.sarif
+          exit-code: '0'
+          skip-setup-trivy: true
+
+      - name: Upload image results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Upload config results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+      # ---------- Deploy (not on pull requests) ----------
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        run: docker push "$IMAGE"
+
+      - name: Log in to Azure (OIDC, no secret)
+        if: github.event_name != 'pull_request'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy ARM template
+        if: github.event_name != 'pull_request'
+        run: |
+          az deployment group create \
+            --resource-group rg-mini-cspm \
+            --name "lab-${GITHUB_RUN_NUMBER}" \
+            --template-file infra/azuredeploy.json \
+            --parameters image="$IMAGE" \
+            --query properties.outputs -o json | tee outputs.json
+
+      - name: Upload FAKE customer file to the public blob container
+        if: github.event_name != 'pull_request'
+        run: |
+          ST=$(jq -r .storageAccount.value outputs.json)
+          az storage blob upload --account-name "$ST" --container-name public-demo \
+            --name fake-customers.csv --file data/fake-customers.csv \
+            --auth-mode key --overwrite -o none
+          echo "Anyone on the internet can now read:"
+          echo "https://$ST.blob.core.windows.net/public-demo/fake-customers.csv"
